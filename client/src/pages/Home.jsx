@@ -4,8 +4,15 @@ import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { yCollab } from "y-codemirror.next";
 import { basicSetup } from "codemirror";
-import { EditorView } from "@codemirror/view";
-import { EditorState } from "@codemirror/state";
+import { Decoration, WidgetType, EditorView } from "@codemirror/view";
+import { StateField, EditorState } from "@codemirror/state";
+import { jwtDecode } from "jwt-decode";
+
+
+
+
+
+
 import { javascript } from "@codemirror/lang-javascript";
 import { html as htmlLang } from "@codemirror/lang-html";
 import { css as cssLang } from "@codemirror/lang-css";
@@ -81,6 +88,25 @@ export default function Home() {
   const lintWorkerRef = useRef(null);
 
   const consoleContainerRef = useRef(null);
+  // Generate a random username and color for collaboration
+// ---------- Logged-in user's name + color ----------
+const randomColors = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#1A535C", "#FF9F1C", "#2EC4B6"];
+
+let decodedName = "Guest";
+try {
+  const token = localStorage.getItem("token");
+  if (token) {
+    const decoded = jwtDecode(token);
+    decodedName = decoded.name || decoded.username || "User";
+  }
+} catch (err) {
+  console.warn("Token decode failed:", err);
+}
+
+const username = useRef(decodedName);
+const userColor = useRef(randomColors[Math.floor(Math.random() * randomColors.length)]);
+
+
 
   // ---------- theme getter ----------
   const getTheme = useCallback(() => {
@@ -138,169 +164,303 @@ export default function Home() {
   };
 
   // ---------- CodeMirror local editor creation ----------
-  const createLocalEditor = (slot, language, initial = "") => {
-    if (viewsRef.current[slot]) {
-      try { viewsRef.current[slot].destroy(); } catch (e) {}
-      viewsRef.current[slot] = null;
+const createLocalEditor = (slot, language, initial = "") => {
+  if (viewsRef.current[slot]) {
+    try { viewsRef.current[slot].destroy(); } catch (e) {}
+    viewsRef.current[slot] = null;
+  }
+
+  const updatePreview = debounce(() => {
+    const h = viewsRef.current.html?.state.doc.toString() || "";
+    const c = viewsRef.current.css?.state.doc.toString() || "";
+    const j = viewsRef.current.js?.state.doc.toString() || "";
+    sendPreview(h, c, j);
+  }, 300);
+
+  const state = EditorState.create({
+    doc: initial,
+    extensions: [
+      basicSetup,
+      language,
+      getTheme(),
+      EditorView.lineWrapping,
+      EditorView.updateListener.of((update) => {
+        if (update.docChanged) updatePreview();
+      }),
+    ],
+  });
+
+  const view = new EditorView({ state, parent: editorDivs.current[slot] });
+  viewsRef.current[slot] = view;
+  return view;
+};
+
+// ---------- Recreate editors when theme changes ----------
+useEffect(() => {
+  // If we are in collaboration mode, skip local rebuild
+  if (providerRef.current && ydocRef.current) return;
+
+  // Destroy and recreate editors with new theme
+  ["html", "css", "js"].forEach((slot) => {
+    const view = viewsRef.current[slot];
+    if (view) {
+      const currentCode = view.state.doc.toString();
+      try { view.destroy(); } catch (e) {}
+      viewsRef.current[slot] = createLocalEditor(
+        slot,
+        slot === "html" ? htmlLang() : slot === "css" ? cssLang() : javascript(),
+        currentCode
+      );
     }
+  });
+}, [themeName]);
 
-    const state = EditorState.create({
-      doc: initial,
-      extensions: [basicSetup, language, EditorView.lineWrapping, getTheme(), EditorView.editable.of(true)],
-    });
 
-    const view = new EditorView({ state, parent: editorDivs.current[slot] });
 
-    // react to changes & update preview
-    view.dispatch = ((origDispatch) => (tr) => {
-      origDispatch(tr);
-      const h = viewsRef.current.html?.state.doc.toString() || "";
-      const c = viewsRef.current.css?.state.doc.toString() || "";
-      const j = viewsRef.current.js?.state.doc.toString() || "";
-      sendPreview(h, c, j);
-    })(view.dispatch);
 
-    viewsRef.current[slot] = view;
-    return view;
-  };
+// ---------- Initialize local editors on mount (before CRDT starts) ----------
+useEffect(() => {
+  // Prevent duplicate initialization
+  if (viewsRef.current.html) return;
 
-  // ---------- CodeMirror Yjs editor creation ----------
-  const createYjsEditor = (slot, ytext, language, provider, ydoc) => {
-    if (viewsRef.current[slot]) {
-      try { viewsRef.current[slot].destroy(); } catch (e) {}
-      viewsRef.current[slot] = null;
-    }
-    if (!ytext || !provider) return null;
+  // Default template or previously saved content
+  const defaultHTML = htmlCode || "<h1>Hello World</h1>";
+  const defaultCSS = cssCode || "h1 { color: teal; }";
+  const defaultJS = jsCode || "console.log('Hello from JS');";
 
-    const awareness = provider.awareness;
-    const undoManager = new Y.UndoManager(ytext);
+  // Create non-collaborative local editors
+  createLocalEditor("html", htmlLang(), defaultHTML);
+  createLocalEditor("css", cssLang(), defaultCSS);
+  createLocalEditor("js", javascript(), defaultJS);
 
-    const state = EditorState.create({
-      doc: ytext.toString(),
-      extensions: [basicSetup, language, yCollab(ytext, awareness, { undoManager }), EditorView.lineWrapping, getTheme(), EditorView.editable.of(true)],
-    });
+  // Send initial preview to iframe
+  sendPreview(defaultHTML, defaultCSS, defaultJS);
+}, []);
 
-    const view = new EditorView({ state, parent: editorDivs.current[slot] });
+// ---------- CodeMirror Yjs editor creation (safe + hover usernames + synced) ----------
+const createYjsEditor = (slot, ytext, language, provider, ydoc) => {
+  if (viewsRef.current[slot]) {
+    try { viewsRef.current[slot].destroy(); } catch (e) {}
+    viewsRef.current[slot] = null;
+  }
+  if (!ytext || !provider) return null;
 
-    const updateFromY = () => {
-      try {
-        const h = ydoc.getText("html").toString();
-        const c = ydoc.getText("css").toString();
-        const j = ydoc.getText("js").toString();
-        sendPreview(h, c, j);
-      } catch (e) {}
-    };
+  const awareness = provider.awareness;
+  const undoManager = new Y.UndoManager(ytext);
 
-    ytext.observeDeep(updateFromY);
-    updateFromY();
+  // set user identity
+  awareness.setLocalStateField("user", {
+    name: username.current,
+    color: userColor.current,
+    editor: slot,
+  });
 
-    viewsRef.current[slot] = view;
-    return view;
-  };
+  // ---- cursor decoration (hover-only username) ----
+  const cursorField = StateField.define({
+    create() { return Decoration.none; },
+    update(deco, tr) {
+      deco = deco.map(tr.changes);
+      const decos = [];
 
-  // ---------- ensure local editors (mount + theme changes fallback) ----------
-  const ensureLocalEditors = useCallback(() => {
-    const prevHtml = viewsRef.current.html ? viewsRef.current.html.state.doc.toString() : "<h1>Hello World</h1>";
-    const prevCss = viewsRef.current.css ? viewsRef.current.css.state.doc.toString() : "h1 { color: teal; }";
-    const prevJs = viewsRef.current.js ? viewsRef.current.js.state.doc.toString() : "console.log('hello');";
+      const docLen = tr.state.doc.length;
+      const states = Array.from(awareness.getStates().values());
 
-    // destroy previous views cleanly
-    Object.values(viewsRef.current).forEach((v) => { try { v?.destroy?.(); } catch (e) {} });
-    viewsRef.current = { html: null, css: null, js: null };
+      for (const s of states) {
+        const user = s.user;
+        const sel = s.selection;
+        if (!user || !sel) continue;
+        if (user.editor !== slot) continue;
 
-    createLocalEditor("html", htmlLang(), prevHtml);
-    createLocalEditor("css", cssLang(), prevCss);
-    createLocalEditor("js", javascript(), prevJs);
+        // ✅ safety check to prevent "position out of range" error
+        if (sel.anchor < 0 || sel.anchor > docLen) continue;
 
-    sendPreview(prevHtml, prevCss, prevJs);
-  }, [getTheme]);
+        const cursorWidget = Decoration.widget({
+          widget: new (class extends WidgetType {
+            toDOM() {
+              const wrapper = document.createElement("span");
+              wrapper.style.position = "relative";
 
-  useEffect(() => {
-    ensureLocalEditors();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+              const cursor = document.createElement("span");
+              cursor.textContent = "▎";
+              cursor.style.color = user.color;
+              cursor.style.fontWeight = "bold";
+              cursor.style.cursor = "pointer";
 
-  // when theme toggles, re-create editors (Yjs-aware)
-  useEffect(() => {
-    if (providerRef.current && ydocRef.current) {
-      const ydoc = ydocRef.current;
-      const provider = providerRef.current;
-      const { html: yhtml, css: ycss, js: yjs } = ytextRefs.current;
-      Object.values(viewsRef.current).forEach((v) => { try { v?.destroy?.(); } catch (e) {} });
-      viewsRef.current = { html: null, css: null, js: null };
-      createYjsEditor("html", yhtml, htmlLang(), provider, ydoc);
-      createYjsEditor("css", ycss, cssLang(), provider, ydoc);
-      createYjsEditor("js", yjs, javascript(), provider, ydoc);
-    } else {
-      ensureLocalEditors();
-    }
-  }, [themeName, ensureLocalEditors]);
+              const tooltip = document.createElement("div");
+              tooltip.textContent = user.name;
+              tooltip.style.position = "absolute";
+              tooltip.style.bottom = "120%";
+              tooltip.style.left = "0";
+              tooltip.style.background = user.color;
+              tooltip.style.color = "#000";
+              tooltip.style.fontSize = "10px";
+              tooltip.style.padding = "2px 4px";
+              tooltip.style.borderRadius = "4px";
+              tooltip.style.whiteSpace = "nowrap";
+              tooltip.style.pointerEvents = "none";
+              tooltip.style.boxShadow = "0 2px 4px rgba(0,0,0,0.4)";
+              tooltip.style.opacity = "0";
+              tooltip.style.transition = "opacity 0.2s ease";
 
-  // ---------- Yjs start / stop ----------
-  const startYjs = async (room) => {
-    if (!room) return alert("Enter a project/room ID");
+              wrapper.addEventListener("mouseenter", () => (tooltip.style.opacity = "1"));
+              wrapper.addEventListener("mouseleave", () => (tooltip.style.opacity = "0"));
 
-    try {
-      // cleanup previous
-      try { providerRef.current?.destroy?.(); ydocRef.current?.destroy?.(); } catch (e) {}
+              wrapper.appendChild(cursor);
+              wrapper.appendChild(tooltip);
+              return wrapper;
+            }
+          })(),
+          side: 1,
+        }).range(sel.anchor);
 
-      const ydoc = new Y.Doc();
-      // NOTE: match the port your server actually uses (we use 1234 in this client)
-      const provider = new WebsocketProvider("ws://localhost:1234", room, ydoc);
-
-      ydocRef.current = ydoc;
-      providerRef.current = provider;
-
-      const yhtml = ydoc.getText("html");
-      const ycss = ydoc.getText("css");
-      const yjs = ydoc.getText("js");
-      ytextRefs.current = { html: yhtml, css: ycss, js: yjs };
-
-      provider.on("status", (ev) => {
-        setConnected(ev.status === "connected");
-        if (ev.status === "connected") {
-          Object.values(viewsRef.current).forEach((v) => { try { v?.destroy?.(); } catch (e) {} });
-          createYjsEditor("html", yhtml, htmlLang(), provider, ydoc);
-          createYjsEditor("css", ycss, cssLang(), provider, ydoc);
-          createYjsEditor("js", yjs, javascript(), provider, ydoc);
-        }
-      });
-
-      provider.on("connection-close", () => {
-        setConnected(false);
-        setTimeout(() => provider.connect(), 2000);
-      });
-      provider.on("connection-error", () => setConnected(false));
-
-      if (!yhtml.toString() && !ycss.toString() && !yjs.toString()) {
-        ydoc.transact(() => {
-          yhtml.insert(0, "<h1>Hello from Yjs</h1>");
-          ycss.insert(0, "h1 { color: teal; }");
-          yjs.insert(0, "console.log('Yjs ready');");
-        });
+        decos.push(cursorWidget);
       }
 
-      toast.success("CRDT session started");
-    } catch (err) {
-      console.error("startYjs error:", err);
-      toast.error("Failed to start CRDT session");
-    }
+      return Decoration.set(decos, true);
+    },
+    provide: (f) => EditorView.decorations.from(f),
+  });
+
+  // ---- create editor state ----
+  const state = EditorState.create({
+    doc: ytext.toString(),
+    extensions: [
+      basicSetup,
+      language,
+      getTheme(),
+      EditorView.lineWrapping,
+      yCollab(ytext, awareness, { undoManager }),
+      cursorField,
+      EditorView.editable.of(true),
+    ],
+  });
+
+  const view = new EditorView({ state, parent: editorDivs.current[slot] });
+  viewsRef.current[slot] = view;
+
+  // ---- sync preview ----
+  const updateFromY = () => {
+    try {
+      const h = ydoc.getText("html").toString();
+      const c = ydoc.getText("css").toString();
+      const j = ydoc.getText("js").toString();
+      sendPreview(h, c, j);
+    } catch (e) {}
   };
 
-  const stopYjs = () => {
-    try {
-      providerRef.current?.destroy?.();
-      ydocRef.current?.destroy?.();
-      providerRef.current = null;
-      ydocRef.current = null;
-      setConnected(false);
-      ensureLocalEditors();
-      toast.success("CRDT session stopped");
-    } catch (err) {
-      console.error("stopYjs:", err);
-      toast.error("Failed to stop CRDT session");
-    }
+  // observe collaborative changes
+  let debounceTimer;
+  ytext.observeDeep(() => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(updateFromY, 150);
+  });
+
+  // update cursor positions in awareness
+  const updateSelection = () => {
+    const sel = view.state.selection.main;
+    awareness.setLocalStateField("selection", { anchor: sel.from, head: sel.to });
+    awareness.setLocalStateField("user", {
+      name: username.current,
+      color: userColor.current,
+      editor: slot,
+    });
   };
+
+  view.dom.addEventListener("mouseup", updateSelection);
+  view.dom.addEventListener("keyup", updateSelection);
+  view.dom.addEventListener("focus", updateSelection);
+
+  return view;
+};
+
+
+// ---------- Yjs start / stop ----------
+const startYjs = async (room) => {
+  if (!room) return alert("Enter a project/room ID");
+
+  try {
+    // cleanup previous session
+    try { providerRef.current?.destroy?.(); ydocRef.current?.destroy?.(); } catch (e) {}
+
+    const ydoc = new Y.Doc();
+    const provider = new WebsocketProvider("ws://localhost:1234", room, ydoc);
+
+    ydocRef.current = ydoc;
+    providerRef.current = provider;
+
+    const yhtml = ydoc.getText("html");
+    const ycss = ydoc.getText("css");
+    const yjs = ydoc.getText("js");
+    ytextRefs.current = { html: yhtml, css: ycss, js: yjs };
+
+    // Awareness setup
+    const awareness = provider.awareness;
+    awareness.setLocalStateField("user", {
+      name: username.current || `User-${Math.floor(Math.random() * 1000)}`,
+      color: userColor.current || "#FFD93D",
+    });
+
+    provider.on("status", (ev) => {
+      setConnected(ev.status === "connected");
+      if (ev.status === "connected") {
+        Object.values(viewsRef.current).forEach((v) => { try { v?.destroy?.(); } catch (e) {} });
+        createYjsEditor("html", yhtml, htmlLang(), provider, ydoc);
+        createYjsEditor("css", ycss, cssLang(), provider, ydoc);
+        createYjsEditor("js", yjs, javascript(), provider, ydoc);
+      }
+    });
+
+    provider.on("connection-close", () => {
+      setConnected(false);
+      setTimeout(() => provider.connect(), 2000);
+    });
+    provider.on("connection-error", () => setConnected(false));
+
+    // initialize with starter text
+    if (!yhtml.toString() && !ycss.toString() && !yjs.toString()) {
+      ydoc.transact(() => {
+        yhtml.insert(0, "<h1>Hello from Yjs Collaboration</h1>");
+        ycss.insert(0, "h1 { color: teal; }");
+        yjs.insert(0, "console.log('Yjs ready');");
+      });
+    }
+
+    toast.success("CRDT session started 🎨 (live cursors active)");
+  } catch (err) {
+    console.error("startYjs error:", err);
+    toast.error("Failed to start CRDT session");
+  }
+};
+
+// ---------- Stop Yjs ----------
+const stopYjs = () => {
+  try {
+    // Disconnect WebSocket provider
+    providerRef.current?.destroy?.();
+    ydocRef.current?.destroy?.();
+
+    providerRef.current = null;
+    ydocRef.current = null;
+    setConnected(false);
+
+    // Recreate local editors for offline mode
+    Object.values(viewsRef.current).forEach((v) => {
+      try { v?.destroy?.(); } catch (e) {}
+    });
+    viewsRef.current = { html: null, css: null, js: null };
+
+    // Reinitialize local editors with current code
+    createLocalEditor("html", htmlLang(), htmlCode);
+    createLocalEditor("css", cssLang(), cssCode);
+    createLocalEditor("js", javascript(), jsCode);
+
+    toast.success("CRDT session stopped 🛑");
+  } catch (err) {
+    console.error("stopYjs error:", err);
+    toast.error("Failed to stop CRDT session");
+  }
+};
+
 
   // ---------- Projects API helpers ----------
   async function fetchProjects() {
@@ -591,6 +751,28 @@ async function handleImport(event) {
     event.target.value = ""; // reset file input
   }
 }
+const [chatMessages, setChatMessages] = useState([]);
+const [chatInput, setChatInput] = useState("");
+
+// shared Yjs array for chat
+const chatYArrayRef = useRef(null);
+
+const sendChatMessage = () => {
+  if (!chatInput.trim() || !ydocRef.current) return;
+  const msg = { name: username.current, color: userColor.current, text: chatInput.trim(), time: Date.now() };
+  chatYArrayRef.current.push([msg]);
+  setChatInput("");
+};
+
+useEffect(() => {
+  if (!ydocRef.current) return;
+  chatYArrayRef.current = ydocRef.current.getArray("chat");
+  const updateChat = () => setChatMessages([...chatYArrayRef.current.toArray()]);
+  chatYArrayRef.current.observe(updateChat);
+  updateChat();
+  return () => chatYArrayRef.current.unobserve(updateChat);
+}, [ydocRef.current]);
+
 
 
   // ---------- Render ----------
@@ -687,7 +869,11 @@ async function handleImport(event) {
           const results = lintResults[lang] || [];
           return (
             <div key={lang} className="flex flex-col border border-gray-700 rounded-lg overflow-hidden">
-              <div className="bg-gray-800 p-2 text-sm font-semibold uppercase text-center">{lang.toUpperCase()}</div>
+          <div className="bg-gray-800 p-2 text-sm font-semibold uppercase text-center">
+  {lang.toUpperCase()}
+</div>
+
+
               <div ref={(el) => (editorDivs.current[lang] = el)} className="h-[300px] bg-gray-900 text-white overflow-y-auto rounded-b-lg"></div>
 
               <div className="bg-gray-950/30 p-2 border-t border-gray-800">
@@ -746,6 +932,39 @@ async function handleImport(event) {
           }
         </div>
       </section>
+
+      {/* Collaboration Chat */}
+<section className="bg-gray-800 p-4 rounded-lg shadow-lg mt-4">
+  <h2 className="text-xl font-semibold mb-2">Team Chat</h2>
+  <div className="h-48 overflow-y-auto bg-gray-900 rounded p-2 text-sm mb-2" id="chat-box">
+    {chatMessages.map((msg, idx) => (
+  <div key={idx} className="flex items-start gap-2 mb-1">
+    <div
+      className="px-2 py-1 rounded text-black text-xs font-semibold"
+      style={{ backgroundColor: msg.color }}
+    >
+      {msg.name}
+    </div>
+    <div className="text-sm text-gray-200">{msg.text}</div>
+  </div>
+))}
+
+  </div>
+  <div className="flex gap-2">
+    <input
+      type="text"
+      placeholder="Type a message..."
+      className="flex-1 bg-gray-700 border border-gray-600 p-2 rounded text-sm"
+      value={chatInput}
+      onChange={(e) => setChatInput(e.target.value)}
+      onKeyDown={(e) => e.key === "Enter" && sendChatMessage()}
+    />
+    <button onClick={sendChatMessage} className="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded text-sm">
+      Send
+    </button>
+  </div>
+</section>
+
 
       {/* Project Manager */}
       {isManagerOpen && (
